@@ -4,13 +4,6 @@
  *
  * Copyright (C) 2026, Zaneham
  * License: GNU GPL, version 2 or later.
- *
- * Written following JPL Coding Guidelines:
- *   - No dynamic memory allocation after initialization
- *   - All loops have fixed upper bounds
- *   - Functions limited to 60 lines
- *   - Assertions for critical invariants
- *   - Simple control flow
  */
 
 #include <assert.h>
