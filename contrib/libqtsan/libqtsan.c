@@ -29,6 +29,14 @@ static int (*real_pthread_create)(pthread_t *, const pthread_attr_t *,
 static int (*real_pthread_join)(pthread_t, void **) = NULL;
 
 /*
+ * Original malloc/free function pointers
+ */
+static void *(*real_malloc)(size_t) = NULL;
+static void (*real_free)(void *) = NULL;
+static void *(*real_calloc)(size_t, size_t) = NULL;
+static void *(*real_realloc)(void *, size_t) = NULL;
+
+/*
  * Notify QTSan plugin via fake syscall
  */
 static void qtsan_notify(enum qtsan_action action, uintptr_t arg1, uintptr_t arg2)
@@ -49,6 +57,10 @@ static void init_real_functions(void)
     real_pthread_mutex_unlock = dlsym(RTLD_NEXT, "pthread_mutex_unlock");
     real_pthread_create = dlsym(RTLD_NEXT, "pthread_create");
     real_pthread_join = dlsym(RTLD_NEXT, "pthread_join");
+    real_malloc = dlsym(RTLD_NEXT, "malloc");
+    real_free = dlsym(RTLD_NEXT, "free");
+    real_calloc = dlsym(RTLD_NEXT, "calloc");
+    real_realloc = dlsym(RTLD_NEXT, "realloc");
 }
 
 /*
@@ -157,6 +169,79 @@ int pthread_join(pthread_t thread, void **retval)
     }
 
     return result;
+}
+
+/*
+ * Hooked malloc - notify plugin to clear shadow for fresh memory
+ */
+void *malloc(size_t size)
+{
+    void *ptr;
+
+    init_real_functions();
+
+    ptr = real_malloc(size);
+
+    if (ptr != NULL) {
+        qtsan_notify(QTSAN_ACTION_MALLOC, (uintptr_t)ptr, size);
+    }
+
+    return ptr;
+}
+
+/*
+ * Hooked free - notify plugin to clear shadow for freed memory
+ */
+void free(void *ptr)
+{
+    init_real_functions();
+
+    if (ptr != NULL) {
+        /* Notify before free so we still have the pointer */
+        qtsan_notify(QTSAN_ACTION_FREE, (uintptr_t)ptr, 0);
+    }
+
+    real_free(ptr);
+}
+
+/*
+ * Hooked calloc - notify plugin to clear shadow for fresh memory
+ */
+void *calloc(size_t nmemb, size_t size)
+{
+    void *ptr;
+
+    init_real_functions();
+
+    ptr = real_calloc(nmemb, size);
+
+    if (ptr != NULL) {
+        qtsan_notify(QTSAN_ACTION_MALLOC, (uintptr_t)ptr, nmemb * size);
+    }
+
+    return ptr;
+}
+
+/*
+ * Hooked realloc - notify plugin about memory change
+ */
+void *realloc(void *old_ptr, size_t size)
+{
+    void *new_ptr;
+
+    init_real_functions();
+
+    if (old_ptr != NULL) {
+        qtsan_notify(QTSAN_ACTION_FREE, (uintptr_t)old_ptr, 0);
+    }
+
+    new_ptr = real_realloc(old_ptr, size);
+
+    if (new_ptr != NULL) {
+        qtsan_notify(QTSAN_ACTION_MALLOC, (uintptr_t)new_ptr, size);
+    }
+
+    return new_ptr;
 }
 
 /*

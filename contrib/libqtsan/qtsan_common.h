@@ -16,7 +16,9 @@ enum qtsan_action {
     QTSAN_ACTION_THREAD_CREATE  = 3,
     QTSAN_ACTION_THREAD_JOIN    = 4,
     QTSAN_ACTION_ACQUIRE        = 5,
-    QTSAN_ACTION_RELEASE        = 6
+    QTSAN_ACTION_RELEASE        = 6,
+    QTSAN_ACTION_MALLOC         = 7,
+    QTSAN_ACTION_FREE           = 8
 };
 
 #endif /* QTSAN_COMMON_H */

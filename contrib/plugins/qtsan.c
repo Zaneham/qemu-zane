@@ -29,6 +29,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define QTSAN_ACTION_MUTEX_UNLOCK   2U
 #define QTSAN_ACTION_THREAD_CREATE  3U
 #define QTSAN_ACTION_THREAD_JOIN    4U
+#define QTSAN_ACTION_MALLOC         7U
+#define QTSAN_ACTION_FREE           8U
 
 /*
  * Configuration - all sizes fixed at compile time
@@ -38,6 +40,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define QTSAN_SHADOW_BUCKETS    65536U
 #define QTSAN_BUCKET_ENTRIES    16U
 #define QTSAN_MAX_MUTEXES       1024U
+#define QTSAN_MAX_ALLOCS        16384U
 
 /*
  * Shadow cell: tracks one memory access
@@ -89,11 +92,21 @@ typedef struct {
 } MutexState;
 
 /*
+ * Allocation info: tracks malloc'd regions for free()
+ */
+typedef struct {
+    uint64_t addr;
+    uint64_t size;
+    bool     valid;
+} AllocInfo;
+
+/*
  * Global state - all statically allocated
  */
 static ShadowBucket g_shadow[QTSAN_SHADOW_BUCKETS];
 static ThreadState  g_threads[QTSAN_MAX_THREADS];
 static MutexState   g_mutexes[QTSAN_MAX_MUTEXES];
+static AllocInfo    g_allocs[QTSAN_MAX_ALLOCS];
 static uint64_t     g_total_accesses;
 static uint64_t     g_total_races;
 static uint64_t     g_sync_ops;
@@ -331,6 +344,96 @@ static void handle_thread_join(uint32_t parent_idx, uint32_t child_idx)
 }
 
 /*
+ * Clear shadow memory for an address range
+ */
+static void shadow_clear_range(uint64_t addr, uint64_t size)
+{
+    uint64_t end;
+    uint64_t cur;
+    uint32_t bucket_idx;
+    ShadowBucket *bucket;
+    uint32_t i;
+
+    end = addr + size;
+
+    for (cur = addr; cur < end; cur += 8U) {
+        bucket_idx = shadow_hash(cur);
+        bucket = &g_shadow[bucket_idx];
+
+        for (i = 0U; i < bucket->count; i++) {
+            if (bucket->addr[i] == (cur & ~7ULL)) {
+                (void)memset(bucket->cells[i], 0, sizeof(bucket->cells[i]));
+            }
+        }
+    }
+}
+
+/*
+ * Handle malloc: track allocation and clear shadow
+ */
+static void handle_malloc(uint64_t ptr, uint64_t size)
+{
+    uint32_t i;
+    uint32_t free_slot;
+    bool found_free;
+
+    /* Clear shadow for fresh memory */
+    shadow_clear_range(ptr, size);
+
+    /* Track allocation for later free */
+    found_free = false;
+    free_slot = 0U;
+
+    for (i = 0U; i < QTSAN_MAX_ALLOCS; i++) {
+        if (!g_allocs[i].valid && !found_free) {
+            free_slot = i;
+            found_free = true;
+            break;
+        }
+    }
+
+    if (found_free) {
+        g_allocs[free_slot].addr = ptr;
+        g_allocs[free_slot].size = size;
+        g_allocs[free_slot].valid = true;
+    }
+
+    if (g_verbose) {
+        (void)fprintf(stderr, "QTSan: malloc 0x%016" PRIx64 " size %" PRIu64 "\n",
+                      ptr, size);
+    }
+}
+
+/*
+ * Handle free: clear shadow memory for freed region
+ */
+static void handle_free(uint64_t ptr)
+{
+    uint32_t i;
+    uint64_t size;
+
+    size = 0U;
+
+    /* Find allocation to get size */
+    for (i = 0U; i < QTSAN_MAX_ALLOCS; i++) {
+        if (g_allocs[i].valid && g_allocs[i].addr == ptr) {
+            size = g_allocs[i].size;
+            g_allocs[i].valid = false;
+            break;
+        }
+    }
+
+    if (size > 0U) {
+        shadow_clear_range(ptr, size);
+
+        if (g_verbose) {
+            (void)fprintf(stderr, "QTSan: free 0x%016" PRIx64 " size %" PRIu64 "\n",
+                          ptr, size);
+        }
+    }
+}
+
+/*
  * Report a detected data race
  */
 static void report_race(uint32_t tid1, uint32_t tid2,
@@ -520,7 +623,6 @@ static bool cb_syscall_filter(qemu_plugin_id_t id, unsigned int vcpu_index,
                                uint64_t *sysret)
 {
     (void)id;
-    (void)a3;
     (void)a4;
     (void)a5;
     (void)a6;
@@ -543,6 +645,12 @@ static bool cb_syscall_filter(qemu_plugin_id_t id, unsigned int vcpu_index,
         break;
     case QTSAN_ACTION_THREAD_JOIN:
         handle_thread_join(vcpu_index, (uint32_t)a2);
+        break;
+    case QTSAN_ACTION_MALLOC:
+        handle_malloc(a2, a3);
+        break;
+    case QTSAN_ACTION_FREE:
+        handle_free(a2);
         break;
     default:
         break;
@@ -660,6 +768,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     (void)memset(g_shadow, 0, sizeof(g_shadow));
     (void)memset(g_threads, 0, sizeof(g_threads));
     (void)memset(g_mutexes, 0, sizeof(g_mutexes));
+    (void)memset(g_allocs, 0, sizeof(g_allocs));
     g_total_accesses = 0U;
     g_total_races = 0U;
     g_sync_ops = 0U;
